@@ -195,12 +195,10 @@ def check_fzf() -> bool:
 
 
 def open_pdf_at_page(filepath: str, page: int) -> bool:
-    """Open a PDF at a specific page using Skim's URL scheme.
+    """Open a PDF in Skim at a specific page via AppleScript.
 
-    Uses skim://open?file=<path>&page=<n> which is reliable and
-    doesn't depend on AppleScript or keyboard shortcut hacks.
-    Falls back to Preview.app without page navigation if Skim
-    is not installed.
+    Skim has proper AppleScript page navigation support, unlike Preview.
+    Falls back to Preview.app (without page navigation) if Skim is not installed.
     """
     path = Path(filepath)
     if not path.exists():
@@ -208,14 +206,25 @@ def open_pdf_at_page(filepath: str, page: int) -> bool:
         return False
 
     if shutil.which("skim"):
-        encoded = __import__("urllib.parse").quote(str(path.resolve()))
-        url = f"skim://open?file={encoded}&page={page}"
-        subprocess.run(["open", url], check=False)
-        return True
+        script = f'''
+        tell application "Skim"
+            activate
+            open POSIX file "{path}"
+            delay 0.3
+            tell document 1
+                set current page to page {page}
+            end tell
+        end tell
+        '''
+        try:
+            subprocess.run(["osascript", "-e", script], check=False, timeout=10)
+            return True
+        except Exception:
+            return False
 
     # Fallback: open in default viewer (no page navigation)
     subprocess.run(["open", str(path)], check=False)
-    return False  # caller can check: True = with page nav, False = without
+    return False
 
 
 def handle_open() -> None:
