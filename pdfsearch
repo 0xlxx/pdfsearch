@@ -195,60 +195,27 @@ def check_fzf() -> bool:
 
 
 def open_pdf_at_page(filepath: str, page: int) -> bool:
-    """Open a PDF in Preview.app at a specific page via AppleScript.
+    """Open a PDF at a specific page using Skim's URL scheme.
 
-    Preview doesn't support CLI page arguments, so we open the file then
-    simulate Cmd+G (Go to Page) via System Events.
+    Uses skim://open?file=<path>&page=<n> which is reliable and
+    doesn't depend on AppleScript or keyboard shortcut hacks.
+    Falls back to Preview.app without page navigation if Skim
+    is not installed.
     """
     path = Path(filepath)
     if not path.exists():
         print(f"Error: file not found: {filepath}", file=sys.stderr)
         return False
 
-    subprocess.run(["open", "-a", "Preview", str(path)], check=False)
-    time.sleep(0.35)
-
-    script = f'''
-    tell application "System Events"
-        tell process "Preview"
-            set frontmost to true
-            keystroke "g" using {{command down}}
-            delay 0.15
-            keystroke "{page}"
-            delay 0.1
-            keystroke return
-        end tell
-    end tell
-    '''
-    try:
-        subprocess.run(
-            ["osascript", "-e", script],
-            check=False, timeout=5, capture_output=True
-        )
-        return True
-    except subprocess.TimeoutExpired:
-        return True  # file opened, navigation timed out but that's OK
-    except Exception:
+    if shutil.which("skim"):
+        encoded = __import__("urllib.parse").quote(str(path.resolve()))
+        url = f"skim://open?file={encoded}&page={page}"
+        subprocess.run(["open", url], check=False)
         return True
 
-
-def handle_preview() -> None:
-    """Extract page text for fzf preview panel. Called via --_preview <path> <page>."""
-    import argparse as ap
-    p = ap.ArgumentParser(add_help=False)
-    p.add_argument("--_preview", nargs=2)
-    args, _ = p.parse_known_args()
-    if args._preview:
-        filepath, page_str = args._preview
-        try:
-            page = int(page_str)
-            doc = fitz.open(filepath)
-            if 1 <= page <= len(doc):
-                sys.stdout.write(doc[page - 1].get_text())
-            doc.close()
-        except Exception:
-            pass
-        sys.exit(0)
+    # Fallback: open in default viewer (no page navigation)
+    subprocess.run(["open", str(path)], check=False)
+    return False  # caller can check: True = with page nav, False = without
 
 
 def handle_open() -> None:
@@ -280,17 +247,12 @@ def run_fzf_interactive(results: list[dict]) -> None:
         lines.append(f"{display}\t{r['file']}\t{r['page']}\n")
     fzf_input = "".join(lines)
 
-    # Resolve self-path for --_preview and --_open sub-calls.
+    # Resolve self-path for --_open sub-calls.
     # In brew installs, PyMuPDF lives alongside the script in libexec,
-    # and the brew wrapper sets PYTHONPATH. fzf subprocesses bypass the
-    # wrapper, so we embed PYTHONPATH directly.
+    # and the brew wrapper sets PYTHONPATH. fzf subprocesses (Ctrl-O)
+    # bypass the wrapper, so we embed PYTHONPATH directly.
     self_path = Path(__file__).resolve()
     lib_dir = str(self_path.parent)
-
-    preview_cmd = (
-        f"PYTHONPATH={shlex.quote(lib_dir)} "
-        f"{shlex.quote(str(self_path))} --_preview '{{1}}' '{{2}}'"
-    )
 
     open_cmd = (
         f"PYTHONPATH={shlex.quote(lib_dir)} "
@@ -301,13 +263,10 @@ def run_fzf_interactive(results: list[dict]) -> None:
         "fzf",
         "--delimiter=\t",
         "--with-nth=1",
-        "--preview", preview_cmd,
-        "--preview-window", "right:55%:wrap",
-        "--preview-label", " Page Preview ",
         "--bind", ",".join(f"f{i}:pos({i})+accept" for i in range(1, 10)),
         "--bind", f"ctrl-o:execute-silent({open_cmd})",
         "--multi",
-        "--header", "Enter=open+quit  Ctrl-O=open+stay  F1-F9=jump  Tab=multi  Esc=quit",
+        "--header", "Enter/Ctrl-O=open  F1-F9=jump  Tab=multi  Esc=quit",
         "--header-first",
     ]
 
@@ -342,9 +301,7 @@ def run_fzf_interactive(results: list[dict]) -> None:
 # ── main ────────────────────────────────────────────────────────────────
 
 def main():
-    # Hidden flags for fzf sub-processes (handled before argparse to avoid clutter)
-    if "--_preview" in sys.argv:
-        handle_preview()
+    # Hidden flag for fzf sub-processes (handled before argparse to avoid clutter)
     if "--_open" in sys.argv:
         handle_open()
 
