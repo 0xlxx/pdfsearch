@@ -198,7 +198,7 @@ def open_pdf_at_page(filepath: str, page: int) -> bool:
     """Open a PDF in Preview.app at a specific page via AppleScript.
 
     Preview doesn't support CLI page arguments, so we open the file then
-    simulate Cmd+Shift+G (Go to Page) via System Events.
+    simulate Cmd+G (Go to Page) via System Events.
     """
     path = Path(filepath)
     if not path.exists():
@@ -212,7 +212,7 @@ def open_pdf_at_page(filepath: str, page: int) -> bool:
     tell application "System Events"
         tell process "Preview"
             set frontmost to true
-            keystroke "g" using {{command down, shift down}}
+            keystroke "g" using {{command down}}
             delay 0.15
             keystroke "{page}"
             delay 0.1
@@ -280,12 +280,22 @@ def run_fzf_interactive(results: list[dict]) -> None:
         lines.append(f"{display}\t{r['file']}\t{r['page']}\n")
     fzf_input = "".join(lines)
 
-    # Resolve self-path for --_preview and --_open sub-calls
+    # Resolve self-path for --_preview and --_open sub-calls.
+    # In brew installs, PyMuPDF lives alongside the script in libexec,
+    # and the brew wrapper sets PYTHONPATH. fzf subprocesses bypass the
+    # wrapper, so we embed PYTHONPATH directly.
     self_path = Path(__file__).resolve()
+    lib_dir = str(self_path.parent)
 
-    # Preview command uses the same script with a hidden flag.
-    # fzf replaces {1} with field 1 (file path), {2} with field 2 (page).
-    preview_cmd = f"{shlex.quote(str(self_path))} --_preview '{{1}}' '{{2}}'"
+    preview_cmd = (
+        f"PYTHONPATH={shlex.quote(lib_dir)} "
+        f"{shlex.quote(str(self_path))} --_preview '{{1}}' '{{2}}'"
+    )
+
+    open_cmd = (
+        f"PYTHONPATH={shlex.quote(lib_dir)} "
+        f"{shlex.quote(str(self_path))} --_open '{{1}}' '{{2}}'"
+    )
 
     fzf_args = [
         "fzf",
@@ -295,7 +305,7 @@ def run_fzf_interactive(results: list[dict]) -> None:
         "--preview-window", "right:55%:wrap",
         "--preview-label", " Page Preview ",
         "--bind", ",".join(f"f{i}:pos({i})+accept" for i in range(1, 10)),
-        "--bind", f"ctrl-o:execute-silent({shlex.quote(str(self_path))} --_open '{{1}}' '{{2}}')",
+        "--bind", f"ctrl-o:execute-silent({open_cmd})",
         "--multi",
         "--header", "Enter=open+quit  Ctrl-O=open+stay  F1-F9=jump  Tab=multi  Esc=quit",
         "--header-first",
