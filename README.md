@@ -51,6 +51,14 @@ pdfsearch "关键词" --json | jq '.[].page'
 pdfsearch "关键词" --no-index
 ```
 
+## Claude Code
+
+Add [pdfsearch skill](https://github.com/0xlxx/skills) to let Claude search your PDF collection. Claude can find relevant textbook passages, read full pages for context, and answer questions grounded in your PDFs — no MCP server needed.
+
+```bash
+git clone https://github.com/0xlxx/skills.git ~/.claude/skills/
+```
+
 ## How it works
 
 `pdfsearch --index` pre-extracts text from all PDFs using PyMuPDF (multi-process), then `ripgrep` searches the index in milliseconds. Re-index when you add or modify PDFs.
