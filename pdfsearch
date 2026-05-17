@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""High-performance PDF search using PyMuPDF (C-speed text extraction).
+
+Usage:
+  pdfsearch "关键词"                           # search all PDFs in current dir
+  pdfsearch "关键词" -I                        # interactive mode with fzf
+  pdfsearch "关键词" -d ./pdfs                 # search specific directory
+  pdfsearch "关键词" -r                        # regex mode
+  pdfsearch "关键词" -c 3                      # show 3 context lines around each match
+  pdfsearch "关键词" --extract-page 42         # extract full page text instead of searching
+  pdfsearch "关键词" --files "上册.pdf"        # filter by filename
+  pdfsearch "关键词" --json                    # JSON output for piping
+  pdfsearch --list                             # list all PDFs with metadata
+
+Interactive mode (requires fzf: brew install fzf):
+  Enter        open selected + quit
+  Ctrl-O       open selected, stay in fzf
+  F1-F9        instant jump to nth result + open + quit
+  Tab          mark multiple, Enter to open all marked
+  Esc          quit
+"""
+
+import argparse
+import json
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import fitz  # PyMuPDF
+
+
+def find_pdfs(directory: Path, name_filter: str | None = None) -> list[Path]:
+    pdfs = sorted(directory.rglob("*.pdf"))
+    if name_filter:
+        pdfs = [p for p in pdfs if name_filter.lower() in p.name.lower()]
+    return pdfs
+
+
+def search_pdf(
+    path: Path,
+    pattern: str,
+    is_regex: bool,
+    context_lines: int,
+    ignore_case: bool,
+) -> list[dict]:
+    results = []
+    compiled = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+    total_pages = 0
+
+    try:
+        doc = fitz.open(str(path))
+        total_pages = len(doc)
+
+        for page_num in range(total_pages):
+            page = doc[page_num]
+            text = page.get_text("text")
+            if not text:
+                continue
+
+            lines = text.splitlines()
+
+            for line_idx, line in enumerate(lines):
+                match_iter = compiled.finditer(line) if is_regex else None
+
+                if is_regex:
+                    for m in match_iter:
+                        results.append(
+                            _build_result(
+                                path, page_num, line_idx, line, m.start(),
+                                m.end(), lines, context_lines, total_pages
+                            )
+                        )
+                else:
+                    search_line = line.lower() if ignore_case else line
+                    search_pat = pattern.lower() if ignore_case else pattern
+                    start = 0
+                    while True:
+                        idx = search_line.find(search_pat, start)
+                        if idx == -1:
+                            break
+                        results.append(
+                            _build_result(
+                                path, page_num, line_idx, line, idx,
+                                idx + len(pattern), lines, context_lines, total_pages
+                            )
+                        )
+                        start = idx + 1
+
+        doc.close()
+    except Exception as e:
+        results.append({
+            "file": str(path),
+            "error": str(e),
+        })
+
+    return results
+
+
+def _build_result(
+    path, page_num, line_idx, line, match_start, match_end, lines, context_lines, total_pages
+):
+    ctx_start = max(0, line_idx - context_lines)
+    ctx_end = min(len(lines), line_idx + context_lines + 1)
+
+    context_before = lines[ctx_start:line_idx]
+    context_after = lines[line_idx + 1:ctx_end]
+    matched_text = line[match_start:match_end]
+
+    return {
+        "file": str(path),
+        "filename": path.name,
+        "page": page_num + 1,
+        "total_pages": total_pages,
+        "line_num": line_idx + 1,
+        "line": line.strip(),
+        "match": matched_text,
+        "match_start": match_start,
+        "match_end": match_end,
+        "context_before": [l.strip() for l in context_before],
+        "context_after": [l.strip() for l in context_after],
+    }
+
+
+def extract_page(path: Path, page_num: int) -> str | None:
+    try:
+        doc = fitz.open(str(path))
+        if page_num < 1 or page_num > len(doc):
+            doc.close()
+            return None
+        text = doc[page_num - 1].get_text("text")
+        doc.close()
+        return text
+    except Exception:
+        return None
+
+
+def format_result(result: dict, show_context: bool) -> str:
+    if "error" in result:
+        return f"  ⚠ {result['error']}"
+
+    file_label = f"{result['filename']}  p{result['page']}/{result['total_pages']}  L{result['line_num']}"
+
+    line = result["line"]
+    m_start = result["match_start"]
+    m_end = result["match_end"]
+    highlighted = (
+        line[:m_start]
+        + "\033[1;33m"
+        + line[m_start:m_end]
+        + "\033[0m"
+        + line[m_end:]
+    )
+
+    out = f"\n  \033[1;36m{file_label}\033[0m\n"
+
+    if show_context and (result["context_before"] or result["context_after"]):
+        for ctx_line in result["context_before"]:
+            out += f"    {ctx_line}\n"
+        out += f"  ▶ {highlighted}\n"
+        for ctx_line in result["context_after"]:
+            out += f"    {ctx_line}\n"
+    else:
+        out += f"  ▶ {highlighted}\n"
+
+    return out
+
+
+def list_pdfs(pdfs: list[Path]) -> None:
+    print(f"\n  Found {len(pdfs)} PDF(s):\n")
+    for p in pdfs:
+        try:
+            doc = fitz.open(str(p))
+            pages = len(doc)
+            size_mb = p.stat().st_size / (1024 * 1024)
+            title = doc.metadata.get("title") or "(no title)"
+            doc.close()
+            print(f"  \033[1m{p.name}\033[0m")
+            print(f"    Pages: {pages}  Size: {size_mb:.1f} MB  Title: {title}\n")
+        except Exception as e:
+            print(f"  \033[1m{p.name}\033[0m")
+            print(f"    ⚠ Cannot read: {e}\n")
+
+    total_size = sum(p.stat().st_size for p in pdfs) / (1024 * 1024)
+    print(f"  Total: {len(pdfs)} files, {total_size:.1f} MB")
+
+
+# ── fzf interactive helpers ────────────────────────────────────────────
+
+def check_fzf() -> bool:
+    return shutil.which("fzf") is not None
+
+
+def open_pdf_at_page(filepath: str, page: int) -> bool:
+    """Open a PDF in Preview.app at a specific page via AppleScript.
+
+    Preview doesn't support CLI page arguments, so we open the file then
+    simulate Cmd+Shift+G (Go to Page) via System Events.
+    """
+    path = Path(filepath)
+    if not path.exists():
+        print(f"Error: file not found: {filepath}", file=sys.stderr)
+        return False
+
+    subprocess.run(["open", "-a", "Preview", str(path)], check=False)
+    time.sleep(0.35)
+
+    script = f'''
+    tell application "System Events"
+        tell process "Preview"
+            set frontmost to true
+            keystroke "g" using {{command down, shift down}}
+            delay 0.15
+            keystroke "{page}"
+            delay 0.1
+            keystroke return
+        end tell
+    end tell
+    '''
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            check=False, timeout=5, capture_output=True
+        )
+        return True
+    except subprocess.TimeoutExpired:
+        return True  # file opened, navigation timed out but that's OK
+    except Exception:
+        return True
+
+
+def handle_preview() -> None:
+    """Extract page text for fzf preview panel. Called via --_preview <path> <page>."""
+    import argparse as ap
+    p = ap.ArgumentParser(add_help=False)
+    p.add_argument("--_preview", nargs=2)
+    args, _ = p.parse_known_args()
+    if args._preview:
+        filepath, page_str = args._preview
+        try:
+            page = int(page_str)
+            doc = fitz.open(filepath)
+            if 1 <= page <= len(doc):
+                sys.stdout.write(doc[page - 1].get_text())
+            doc.close()
+        except Exception:
+            pass
+        sys.exit(0)
+
+
+def handle_open() -> None:
+    """Open PDF at page. Called via --_open <path> <page> (from fzf key bindings)."""
+    import argparse as ap
+    p = ap.ArgumentParser(add_help=False)
+    p.add_argument("--_open", nargs=2)
+    args, _ = p.parse_known_args()
+    if args._open:
+        open_pdf_at_page(args._open[0], int(args._open[1]))
+        sys.exit(0)
+
+
+def run_fzf_interactive(results: list[dict]) -> None:
+    """Pipe search results to fzf for interactive filtering and one-click open."""
+    if not check_fzf():
+        print("fzf not found. Install with: brew install fzf", file=sys.stderr)
+        return
+
+    valid = [r for r in results if "error" not in r]
+    if not valid:
+        print("No matches to open.", file=sys.stderr)
+        return
+
+    # Build fzf input: display \t filepath \t page
+    lines = []
+    for r in valid:
+        display = f"{r['filename']}  p{r['page']}  ▶  {r['line'][:120]}"
+        lines.append(f"{display}\t{r['file']}\t{r['page']}\n")
+    fzf_input = "".join(lines)
+
+    # Resolve self-path for --_preview and --_open sub-calls
+    self_path = Path(__file__).resolve()
+
+    # Preview command uses the same script with a hidden flag.
+    # fzf replaces {1} with field 1 (file path), {2} with field 2 (page).
+    preview_cmd = f"{shlex.quote(str(self_path))} --_preview '{{1}}' '{{2}}'"
+
+    fzf_args = [
+        "fzf",
+        "--delimiter=\t",
+        "--with-nth=1",
+        "--preview", preview_cmd,
+        "--preview-window", "right:55%:wrap",
+        "--preview-label", " Page Preview ",
+        "--bind", ",".join(f"f{i}:pos({i})+accept" for i in range(1, 10)),
+        "--bind", f"ctrl-o:execute-silent({shlex.quote(str(self_path))} --_open '{{1}}' '{{2}}')",
+        "--multi",
+        "--header", "Enter=open+quit  Ctrl-O=open+stay  F1-F9=jump  Tab=multi  Esc=quit",
+        "--header-first",
+    ]
+
+    try:
+        proc = subprocess.run(
+            fzf_args,
+            input=fzf_input,
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        print("fzf not found. Install with: brew install fzf", file=sys.stderr)
+        return
+
+    # Exit codes: 0=selection made, 1=no match, 130=interrupted (Esc/Ctrl-C)
+    if proc.returncode not in (0, 1):
+        return
+
+    stdout = proc.stdout.strip()
+    if not stdout:
+        return
+
+    for line_text in stdout.splitlines():
+        parts = line_text.split("\t")
+        if len(parts) >= 3:
+            filepath = parts[1]
+            page = int(parts[2])
+            print(f"\n  → Opening {Path(filepath).name} at page {page}...")
+            open_pdf_at_page(filepath, page)
+
+
+# ── main ────────────────────────────────────────────────────────────────
+
+def main():
+    # Hidden flags for fzf sub-processes (handled before argparse to avoid clutter)
+    if "--_preview" in sys.argv:
+        handle_preview()
+    if "--_open" in sys.argv:
+        handle_open()
+
+    parser = argparse.ArgumentParser(
+        description="High-performance PDF full-text search (PyMuPDF backend)",
+        epilog="Examples:\n"
+               "  pdfsearch '鸦片战争'\n"
+               "  pdfsearch '鸦片战争' -I\n"
+               "  pdfsearch '秦.*统一' -r\n"
+               "  pdfsearch '封建' -c 2 --files '必修'\n"
+               "  pdfsearch --extract-page 15",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("query", nargs="?", help="Search query (plain text or regex with -r)")
+    parser.add_argument("-d", "--dir", default=".", help="Directory to search (default: .)")
+    parser.add_argument("-r", "--regex", action="store_true", help="Treat query as regex")
+    parser.add_argument("-c", "--context", type=int, default=0, help="Context lines around match")
+    parser.add_argument("-i", "--ignore-case", action="store_true", default=True, help="Ignore case (default: True)")
+    parser.add_argument("--case-sensitive", action="store_true", help="Case-sensitive search")
+    parser.add_argument("--files", help="Filter PDF filenames (substring match)")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("-I", "--interactive", action="store_true", help="Interactive mode with fzf: filter, preview, and open PDFs")
+    parser.add_argument("--extract-page", type=int, help="Extract full text of a page (by page number)")
+    parser.add_argument("--list", action="store_true", help="List all PDFs with metadata, don't search")
+    args = parser.parse_args()
+
+    if args.interactive and args.json:
+        print("Error: -I/--interactive and --json are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+
+    directory = Path(args.dir).expanduser().resolve()
+    if not directory.is_dir():
+        print(f"Error: '{directory}' is not a directory", file=sys.stderr)
+        sys.exit(1)
+
+    pdfs = find_pdfs(directory, args.files)
+    if not pdfs:
+        print(f"No PDFs found in {directory}" + (f" matching '{args.files}'" if args.files else ""))
+        sys.exit(0)
+
+    if args.list:
+        list_pdfs(pdfs)
+        return
+
+    if not args.query and not args.extract_page:
+        parser.print_help()
+        sys.exit(1)
+
+    if args.extract_page:
+        text = extract_page(pdfs[0], args.extract_page)
+        if text is None:
+            print(f"Page {args.extract_page} not found in {pdfs[0].name}", file=sys.stderr)
+            sys.exit(1)
+        print(text)
+        return
+
+    # Search
+    ignore_case = not args.case_sensitive
+    start_time = time.perf_counter()
+
+    all_results = []
+    for pdf in pdfs:
+        all_results.extend(search_pdf(pdf, args.query, args.regex, args.context, ignore_case))
+
+    elapsed = time.perf_counter() - start_time
+
+    if args.interactive:
+        run_fzf_interactive(all_results)
+        return
+
+    if args.json:
+        print(json.dumps(all_results, ensure_ascii=False, indent=2))
+    else:
+        show_context = args.context > 0
+        for r in all_results:
+            print(format_result(r, show_context), end="")
+
+        match_count = len([r for r in all_results if "error" not in r])
+        error_count = len([r for r in all_results if "error" in r])
+        files_with_matches = len({r["file"] for r in all_results if "error" not in r})
+
+        print(f"\n  ──────────────────────────────")
+        print(f"  {match_count} match(es) across {files_with_matches} file(s)")
+        if error_count:
+            print(f"  {error_count} file(s) with errors")
+        print(f"  Searched {len(pdfs)} PDF(s) in {elapsed:.2f}s")
+
+
+if __name__ == "__main__":
+    main()
