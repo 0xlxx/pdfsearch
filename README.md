@@ -1,6 +1,6 @@
 # pdfsearch
 
-High-performance PDF full-text search with fzf interactive mode.
+High-performance PDF full-text search with text indexing and fzf interactive mode.
 
 ## Install
 
@@ -8,26 +8,35 @@ High-performance PDF full-text search with fzf interactive mode.
 brew install 0xlxx/tap/pdfsearch
 ```
 
-Requires `fzf` for interactive mode:
+Requires `fzf` and `ripgrep` for full functionality:
 
 ```bash
-brew install fzf
+brew install fzf ripgrep
+```
+
+Interactive mode also requires Skim for page-accurate PDF opening:
+
+```bash
+brew install --cask skim
 ```
 
 ## Usage
 
 ```bash
-# Search all PDFs in current directory
+# Build text index (one-time, multi-threaded)
+pdfsearch --index
+
+# Search — near-instant after indexing
 pdfsearch "鸦片战争"
 
-# Regex search
-pdfsearch "秦.*统一" -r
-
-# Interactive mode — filter with fzf, open in Preview
+# Interactive mode — filter with fzf, double-click to open
 pdfsearch "鸦片战争" -I
 
 # Search a specific directory
 pdfsearch "关键词" -d ~/Documents/pdfs
+
+# Regex search
+pdfsearch "秦.*统一" -r
 
 # Filter by filename
 pdfsearch "变法" --files "必修"
@@ -37,19 +46,26 @@ pdfsearch "封建" -c 2
 
 # JSON output for scripting
 pdfsearch "关键词" --json | jq '.[].page'
+
+# Skip index, search PDFs directly
+pdfsearch "关键词" --no-index
 ```
+
+## How it works
+
+`pdfsearch --index` pre-extracts text from all PDFs using PyMuPDF (multi-process), then `ripgrep` searches the index in milliseconds. Re-index when you add or modify PDFs.
 
 ### Interactive mode
 
-`-I` opens search results in fzf with live filtering, page preview, and one-key
-navigation:
+`-I` opens search results in fzf with live filtering and one-click navigation:
 
 | Key | Action |
 |-----|--------|
-| Enter | Open selected in Preview, quit fzf |
+| Enter | Open selected, quit fzf |
 | Ctrl-O | Open selected, stay in fzf |
-| F1–F9 | Jump to nth result, open, quit |
+| Double-click | Open selected, quit fzf |
+| F1-F9 | Jump to nth result, open, quit |
 | Tab | Multi-select, Enter opens all marked |
 | Esc | Quit |
 
-Matches open in Preview.app at the exact page via AppleScript.
+Matches open at the exact page via Skim (AppleScript). Falls back to Sioyek if Skim is unavailable. Install one of them for page-accurate navigation:

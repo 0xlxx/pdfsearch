@@ -1,33 +1,40 @@
 #!/usr/bin/env python3
-"""High-performance PDF search using PyMuPDF (C-speed text extraction).
+"""High-performance PDF search using PyMuPDF + ripgrep with text indexing.
 
 Usage:
-  pdfsearch "关键词"                           # search all PDFs in current dir
-  pdfsearch "关键词" -I                        # interactive mode with fzf
-  pdfsearch "关键词" -d ./pdfs                 # search specific directory
-  pdfsearch "关键词" -r                        # regex mode
-  pdfsearch "关键词" -c 3                      # show 3 context lines around each match
-  pdfsearch "关键词" --extract-page 42         # extract full page text instead of searching
-  pdfsearch "关键词" --files "上册.pdf"        # filter by filename
-  pdfsearch "关键词" --json                    # JSON output for piping
-  pdfsearch --list                             # list all PDFs with metadata
+  pdfsearch --index                            # build text index (one-time)
+  pdfsearch "关键词"                            # search index (milliseconds)
+  pdfsearch "关键词" -I                         # interactive mode with fzf
+  pdfsearch "关键词" -d ./pdfs                  # search specific directory
+  pdfsearch "关键词" -r                         # regex mode
+  pdfsearch "关键词" -c 3                       # show 3 context lines around each match
+  pdfsearch "关键词" --extract-page 42          # extract full page text instead of searching
+  pdfsearch "关键词" --files "上册.pdf"         # filter by filename
+  pdfsearch "关键词" --json                     # JSON output for piping
+  pdfsearch "关键词" --no-index                 # skip index, search PDFs directly
+  pdfsearch --list                              # list all PDFs with metadata
+  pdfsearch --reindex                           # force rebuild index
 
 Interactive mode (requires fzf: brew install fzf):
-  Enter        open selected + quit
-  Ctrl-O       open selected, stay in fzf
-  F1-F9        instant jump to nth result + open + quit
-  Tab          mark multiple, Enter to open all marked
-  Esc          quit
+  Enter         open selected + quit
+  Ctrl-O        open selected, stay in fzf
+  Double-click  open selected + quit
+  F1-F9         instant jump to nth result + open + quit
+  Tab           mark multiple, Enter to open all marked
+  Esc           quit
 """
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+from multiprocessing import Pool
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -100,16 +107,24 @@ def search_pdf(
     return results
 
 
+def _compute_context(
+    lines: list[str], line_idx: int, context_lines: int
+) -> tuple[list[str], list[str]]:
+    """Return (context_before, context_after) as stripped line lists."""
+    if context_lines <= 0:
+        return [], []
+    ctx_start = max(0, line_idx - context_lines)
+    ctx_end = min(len(lines), line_idx + context_lines + 1)
+    return (
+        [l.strip() for l in lines[ctx_start:line_idx]],
+        [l.strip() for l in lines[line_idx + 1:ctx_end]],
+    )
+
+
 def _build_result(
     path, page_num, line_idx, line, match_start, match_end, lines, context_lines, total_pages
 ):
-    ctx_start = max(0, line_idx - context_lines)
-    ctx_end = min(len(lines), line_idx + context_lines + 1)
-
-    context_before = lines[ctx_start:line_idx]
-    context_after = lines[line_idx + 1:ctx_end]
-    matched_text = line[match_start:match_end]
-
+    ctx_before, ctx_after = _compute_context(lines, line_idx, context_lines)
     return {
         "file": str(path),
         "filename": path.name,
@@ -117,11 +132,11 @@ def _build_result(
         "total_pages": total_pages,
         "line_num": line_idx + 1,
         "line": line.strip(),
-        "match": matched_text,
+        "match": line[match_start:match_end],
         "match_start": match_start,
         "match_end": match_end,
-        "context_before": [l.strip() for l in context_before],
-        "context_after": [l.strip() for l in context_after],
+        "context_before": ctx_before,
+        "context_after": ctx_after,
     }
 
 
@@ -188,24 +203,267 @@ def list_pdfs(pdfs: list[Path]) -> None:
     print(f"  Total: {len(pdfs)} files, {total_size:.1f} MB")
 
 
+# ── index management ───────────────────────────────────────────────────
+
+INDEX_ROOT = Path.home() / ".pdfsearch" / "index"
+
+
+def _hash_path(path: Path) -> str:
+    return hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:16]
+
+
+def _get_index_dir(path: Path) -> Path:
+    return INDEX_ROOT / _hash_path(path)
+
+
+def _read_meta(hash_dir: Path) -> dict | None:
+    try:
+        return json.loads((hash_dir / "meta.json").read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _read_valid_meta(pdf_path: Path) -> dict | None:
+    """Return meta dict if index exists and is fresh (mtime/size match), else None."""
+    meta = _read_meta(_get_index_dir(pdf_path))
+    if meta is None:
+        return None
+    try:
+        stat = pdf_path.stat()
+    except OSError:
+        return None
+    if meta.get("mtime") != stat.st_mtime or meta.get("size") != stat.st_size:
+        return None
+    return meta
+
+
+def _collect_index_map(pdfs: list[Path]) -> dict[str, dict]:
+    """Build map of hash_dir_str -> meta for all fresh indexed PDFs."""
+    index_map = {}
+    for pdf in pdfs:
+        meta = _read_valid_meta(pdf)
+        if meta:
+            index_map[str(_get_index_dir(pdf))] = meta
+    return index_map
+
+
+def _index_one_pdf(pdf_path: Path) -> None:
+    """Extract text from a single PDF and write page txt files + meta.json."""
+    hash_dir = _get_index_dir(pdf_path)
+    try:
+        hash_dir.mkdir(parents=True, exist_ok=True)
+        doc = fitz.open(str(pdf_path))
+        total_pages = len(doc)
+        for page_num in range(total_pages):
+            text = doc[page_num].get_text("text")
+            (hash_dir / f"page_{page_num + 1:04d}.txt").write_text(text)
+        doc.close()
+        stat = pdf_path.stat()
+        meta = {
+            "path": str(pdf_path.resolve()),
+            "filename": pdf_path.name,
+            "mtime": stat.st_mtime,
+            "size": stat.st_size,
+            "pages": total_pages,
+        }
+        (hash_dir / "meta.json").write_text(json.dumps(meta))
+    except Exception as e:
+        print(f"  Warning: failed to index {pdf_path.name}: {e}", file=sys.stderr)
+
+
+def build_index(directory: Path, force: bool = False, workers: int | None = None) -> int:
+    """Build/update text index for all PDFs in directory. Returns number indexed."""
+    pdfs = find_pdfs(directory)
+    if not pdfs:
+        print(f"No PDFs found in {directory}")
+        return 0
+
+    if workers is None:
+        workers = os.cpu_count() or 4
+
+    to_index = []
+    for pdf in pdfs:
+        if not force and _read_valid_meta(pdf) is not None:
+            continue
+        to_index.append(pdf)
+
+    if not to_index:
+        print(f"All {len(pdfs)} PDF(s) already indexed. Use --reindex to force rebuild.")
+        return 0
+
+    print(f"Indexing {len(to_index)} PDF(s) with {workers} workers...")
+    start = time.perf_counter()
+
+    with Pool(workers, maxtasksperchild=10) as pool:
+        pool.map(_index_one_pdf, to_index)
+
+    elapsed = time.perf_counter() - start
+    print(f"Indexed {len(to_index)} PDF(s) in {elapsed:.1f}s")
+    return len(to_index)
+
+
+# ── ripgrep search ─────────────────────────────────────────────────────
+
+def _rg_match_to_result(
+    match: dict, index_map: dict[str, dict]
+) -> dict | None:
+    """Convert a single ripgrep JSON match entry to unified result dict."""
+    data = match.get("data", {})
+    path_text = data.get("path", {}).get("text", "")
+    page_path = Path(path_text)
+    hash_dir = str(page_path.parent)
+
+    meta = index_map.get(hash_dir)
+    if meta is None:
+        return None
+
+    page_num = int(page_path.stem.split("_")[1])
+    line_num = data.get("line_number", 1)
+    line_idx = line_num - 1
+
+    try:
+        lines = page_path.read_text().splitlines()
+    except OSError:
+        return None
+
+    matched_line = lines[line_idx] if 0 <= line_idx < len(lines) else ""
+
+    submatches = data.get("submatches", [])
+    if submatches:
+        matched_text = submatches[0].get("match", {}).get("text", "")
+        # rg reports byte offsets; convert to character offsets for highlighting
+        line_bytes = matched_line.encode("utf-8")
+        m_start = len(line_bytes[:submatches[0].get("start", 0)].decode("utf-8"))
+        m_end = len(line_bytes[:submatches[0].get("end", 0)].decode("utf-8"))
+    else:
+        m_start = 0
+        m_end = 0
+        matched_text = ""
+
+    return {
+        "file": meta["path"],
+        "filename": meta["filename"],
+        "page": page_num,
+        "total_pages": meta["pages"],
+        "line_num": line_idx + 1,
+        "line": matched_line.strip(),
+        "match": matched_text,
+        "match_start": m_start,
+        "match_end": m_end,
+        "context_before": [],
+        "context_after": [],
+        "_lines": lines,
+        "_line_idx": line_idx,
+    }
+
+
+def _add_context(result: dict, context_lines: int) -> None:
+    """Mutate result with context lines around the match (uses cached page lines)."""
+    if context_lines <= 0:
+        return
+    lines = result.pop("_lines", None)
+    line_idx = result.pop("_line_idx", None)
+    if lines is None or line_idx is None:
+        return
+    result["context_before"], result["context_after"] = _compute_context(
+        lines, line_idx, context_lines
+    )
+
+
+def search_via_ripgrep(
+    query: str,
+    index_map: dict[str, dict],
+    is_regex: bool,
+    ignore_case: bool,
+    context_lines: int,
+) -> list[dict]:
+    """Search indexed PDFs using ripgrep. Returns unified result list."""
+    search_paths = []
+    for hash_dir_str, meta in index_map.items():
+        hash_dir = Path(hash_dir_str)
+        for page_num in range(1, meta["pages"] + 1):
+            search_paths.append(hash_dir / f"page_{page_num:04d}.txt")
+
+    if not search_paths:
+        return []
+
+    rg_args = ["rg", "--json", "--with-filename", "--line-number", "--no-heading"]
+
+    if not is_regex:
+        rg_args.append("--fixed-strings")
+    if ignore_case:
+        rg_args.append("--ignore-case")
+
+    rg_args.append("--")
+    rg_args.append(query)
+    rg_args.extend(str(p) for p in search_paths)
+
+    try:
+        proc = subprocess.run(rg_args, capture_output=True, text=True)
+    except FileNotFoundError:
+        print("ripgrep (rg) not found. Install with: brew install ripgrep", file=sys.stderr)
+        return []
+
+    if proc.returncode not in (0, 1):
+        return []
+
+    results = []
+    for line_text in proc.stdout.splitlines():
+        try:
+            entry = json.loads(line_text)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") != "match":
+            continue
+
+        result = _rg_match_to_result(entry, index_map)
+        if result is None:
+            continue
+
+        if context_lines > 0:
+            _add_context(result, context_lines)
+        else:
+            result.pop("_lines", None)
+            result.pop("_line_idx", None)
+
+        results.append(result)
+
+    return results
+
+
 # ── fzf interactive helpers ────────────────────────────────────────────
 
 def check_fzf() -> bool:
     return shutil.which("fzf") is not None
 
 
-def open_pdf_at_page(filepath: str, page: int) -> bool:
-    """Open a PDF in Skim at a specific page via AppleScript.
+def _has_skim() -> bool:
+    """Check if Skim.app is installed (it has no CLI binary, check the bundle)."""
+    skim_paths = [
+        Path("/Applications/Skim.app"),
+        Path.home() / "Applications/Skim.app",
+    ]
+    return any(p.exists() for p in skim_paths)
 
-    Skim has proper AppleScript page navigation support, unlike Preview.
-    Falls back to Preview.app (without page navigation) if Skim is not installed.
+
+def _check_page_viewer() -> bool:
+    """Return True if a page-accurate PDF viewer is available."""
+    return _has_skim() or shutil.which("sioyek") is not None
+
+
+def open_pdf_at_page(filepath: str, page: int) -> bool:
+    """Open a PDF at a specific page, trying viewers in priority order.
+
+    Chain: Skim (AppleScript) → Sioyek (--page) → open (no page nav).
+    Returns True if page-accurate navigation succeeded, False otherwise.
     """
     path = Path(filepath)
     if not path.exists():
         print(f"Error: file not found: {filepath}", file=sys.stderr)
         return False
 
-    if shutil.which("skim"):
+    # 1. Skim via AppleScript — most reliable page navigation
+    if _has_skim():
         script = f'''
         tell application "Skim"
             activate
@@ -220,9 +478,20 @@ def open_pdf_at_page(filepath: str, page: int) -> bool:
             subprocess.run(["osascript", "-e", script], check=False, timeout=10)
             return True
         except Exception:
-            return False
+            pass
 
-    # Fallback: open in default viewer (no page navigation)
+    # 2. Sioyek via --page flag (brew install sioyek)
+    if shutil.which("sioyek"):
+        try:
+            subprocess.run(
+                ["sioyek", str(path), "--page", str(page)],
+                check=False, timeout=10,
+            )
+            return True
+        except Exception:
+            pass
+
+    # 3. Fallback: open in default viewer (no page navigation)
     subprocess.run(["open", str(path)], check=False)
     return False
 
@@ -274,8 +543,9 @@ def run_fzf_interactive(results: list[dict]) -> None:
         "--with-nth=1",
         "--bind", ",".join(f"f{i}:pos({i})+accept" for i in range(1, 10)),
         "--bind", f"ctrl-o:execute-silent({open_cmd})",
+        "--bind", f"double-click:execute-silent({open_cmd})+accept",
         "--multi",
-        "--header", "Enter/Ctrl-O=open  F1-F9=jump  Tab=multi  Esc=quit",
+        "--header", "Enter=open+quit  Ctrl-O=open+stay  F1-F9=jump  Tab=multi  DblClick=open  Esc=quit",
         "--header-first",
     ]
 
@@ -317,11 +587,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="High-performance PDF full-text search (PyMuPDF backend)",
         epilog="Examples:\n"
-               "  pdfsearch '鸦片战争'\n"
-               "  pdfsearch '鸦片战争' -I\n"
-               "  pdfsearch '秦.*统一' -r\n"
-               "  pdfsearch '封建' -c 2 --files '必修'\n"
-               "  pdfsearch --extract-page 15",
+               "  pdfsearch --index                        # build index for instant search\n"
+               "  pdfsearch '鸦片战争'                       # search (uses index if available)\n"
+               "  pdfsearch '鸦片战争' -I                    # search + interactive fzf mode\n"
+               "  pdfsearch '秦.*统一' -r                    # regex search\n"
+               "  pdfsearch '封建' -c 2 --files '必修'       # context lines + name filter\n"
+               "  pdfsearch --extract-page 15               # extract full page text",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("query", nargs="?", help="Search query (plain text or regex with -r)")
@@ -335,6 +606,9 @@ def main():
     parser.add_argument("-I", "--interactive", action="store_true", help="Interactive mode with fzf: filter, preview, and open PDFs")
     parser.add_argument("--extract-page", type=int, help="Extract full text of a page (by page number)")
     parser.add_argument("--list", action="store_true", help="List all PDFs with metadata, don't search")
+    parser.add_argument("--index", action="store_true", help="Build/update text index for fast search")
+    parser.add_argument("--reindex", action="store_true", help="Force rebuild text index from scratch")
+    parser.add_argument("--no-index", action="store_true", help="Skip index, search PDFs directly")
     args = parser.parse_args()
 
     if args.interactive and args.json:
@@ -347,19 +621,29 @@ def main():
         sys.exit(1)
 
     pdfs = find_pdfs(directory, args.files)
-    if not pdfs:
-        print(f"No PDFs found in {directory}" + (f" matching '{args.files}'" if args.files else ""))
+
+    def _exit_no_pdfs():
+        msg = f"No PDFs found in {directory}"
+        if args.files:
+            msg += f" matching '{args.files}'"
+        print(msg)
         sys.exit(0)
 
+    if args.index or args.reindex:
+        if not pdfs:
+            _exit_no_pdfs()
+        build_index(directory, force=args.reindex)
+        return
+
     if args.list:
+        if not pdfs:
+            _exit_no_pdfs()
         list_pdfs(pdfs)
         return
 
-    if not args.query and not args.extract_page:
-        parser.print_help()
-        sys.exit(1)
-
     if args.extract_page:
+        if not pdfs:
+            _exit_no_pdfs()
         text = extract_page(pdfs[0], args.extract_page)
         if text is None:
             print(f"Page {args.extract_page} not found in {pdfs[0].name}", file=sys.stderr)
@@ -367,18 +651,37 @@ def main():
         print(text)
         return
 
-    # Search
+    if not args.query:
+        parser.print_help()
+        sys.exit(1)
+
     ignore_case = not args.case_sensitive
     start_time = time.perf_counter()
 
     all_results = []
-    for pdf in pdfs:
+    index_map = {} if args.no_index else _collect_index_map(pdfs)
+
+    if index_map:
+        all_results = search_via_ripgrep(
+            args.query, index_map, args.regex, ignore_case, args.context,
+        )
+        indexed_paths = {Path(m["path"]).resolve() for m in index_map.values()}
+        unindexed = [p for p in pdfs if p.resolve() not in indexed_paths]
+    else:
+        unindexed = pdfs
+
+    for pdf in unindexed:
         all_results.extend(search_pdf(pdf, args.query, args.regex, args.context, ignore_case))
 
     elapsed = time.perf_counter() - start_time
+    used_index = bool(index_map)
+
+    has_matches = any("error" not in r for r in all_results)
 
     if args.interactive:
         run_fzf_interactive(all_results)
+        if not _check_page_viewer() and has_matches:
+            print("  Install Skim for page-accurate PDF opening: brew install --cask skim", file=sys.stderr)
         return
 
     if args.json:
@@ -396,7 +699,14 @@ def main():
         print(f"  {match_count} match(es) across {files_with_matches} file(s)")
         if error_count:
             print(f"  {error_count} file(s) with errors")
-        print(f"  Searched {len(pdfs)} PDF(s) in {elapsed:.2f}s")
+        if used_index:
+            print(f"  Searched index ({len(pdfs)} PDFs) in {elapsed:.2f}s")
+        else:
+            print(f"  Searched {len(pdfs)} PDF(s) in {elapsed:.2f}s")
+        if not used_index and pdfs:
+            print(f"  Tip: run 'pdfsearch --index' for near-instant searches")
+        if not _check_page_viewer() and has_matches:
+            print(f"  Tip: install Skim for page-accurate opening: brew install --cask skim")
 
 
 if __name__ == "__main__":
