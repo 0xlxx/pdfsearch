@@ -45,7 +45,16 @@ pdfsearch "变法" --files "必修"
 pdfsearch "封建" -c 2
 
 # JSON output for scripting
-pdfsearch "关键词" --json | jq '.[].page'
+pdfsearch "关键词" --json | jq '.matches[].page'
+
+# Search a specific PDF file by path
+pdfsearch "关键词" --file ~/Documents/specific.pdf --json
+
+# Extract a page from a specific PDF
+pdfsearch --file ~/Documents/specific.pdf --extract-page 42
+
+# List PDFs as structured JSON
+pdfsearch --list --json | jq '.files[].filename'
 
 # Skip index, search PDFs directly
 pdfsearch "关键词" --no-index

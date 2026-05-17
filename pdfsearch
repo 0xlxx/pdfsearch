@@ -10,9 +10,12 @@ Usage:
   pdfsearch "关键词" -c 3                       # show 3 context lines around each match
   pdfsearch "关键词" --extract-page 42          # extract full page text instead of searching
   pdfsearch "关键词" --files "上册.pdf"         # filter by filename
+  pdfsearch "关键词" --file /abs/path/to.pdf    # search single PDF by path
+  pdfsearch --file /abs/path/to.pdf --extract-page 42  # extract page from specific PDF
   pdfsearch "关键词" --json                     # JSON output for piping
   pdfsearch "关键词" --no-index                 # skip index, search PDFs directly
   pdfsearch --list                              # list all PDFs with metadata
+  pdfsearch --list --json                       # list PDFs as structured JSON
   pdfsearch --reindex                           # force rebuild index
 
 Interactive mode (requires fzf: brew install fzf):
@@ -201,6 +204,31 @@ def list_pdfs(pdfs: list[Path]) -> None:
 
     total_size = sum(p.stat().st_size for p in pdfs) / (1024 * 1024)
     print(f"  Total: {len(pdfs)} files, {total_size:.1f} MB")
+
+
+def list_pdfs_json(pdfs: list[Path]) -> None:
+    files = []
+    for p in pdfs:
+        try:
+            doc = fitz.open(str(p))
+            pages = len(doc)
+            size_mb = p.stat().st_size / (1024 * 1024)
+            title = doc.metadata.get("title") or ""
+            doc.close()
+            files.append({
+                "filename": p.name,
+                "path": str(p),
+                "pages": pages,
+                "size_mb": round(size_mb, 1),
+                "title": title,
+            })
+        except Exception as e:
+            files.append({"filename": p.name, "path": str(p), "error": str(e)})
+    total_mb = sum(p.stat().st_size for p in pdfs) / (1024 * 1024)
+    print(json.dumps(
+        {"total": len(pdfs), "total_size_mb": round(total_mb, 1), "files": files},
+        ensure_ascii=False, indent=2,
+    ))
 
 
 # ── index management ───────────────────────────────────────────────────
@@ -592,7 +620,9 @@ def main():
                "  pdfsearch '鸦片战争' -I                    # search + interactive fzf mode\n"
                "  pdfsearch '秦.*统一' -r                    # regex search\n"
                "  pdfsearch '封建' -c 2 --files '必修'       # context lines + name filter\n"
-               "  pdfsearch --extract-page 15               # extract full page text",
+               "  pdfsearch --file /path/to/doc.pdf --extract-page 15  # extract page from specific file\n"
+               "  pdfsearch --extract-page 15               # extract full page text\n"
+               "  pdfsearch --list --json                    # list PDFs as structured JSON",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("query", nargs="?", help="Search query (plain text or regex with -r)")
@@ -602,6 +632,7 @@ def main():
     parser.add_argument("-i", "--ignore-case", action="store_true", default=True, help="Ignore case (default: True)")
     parser.add_argument("--case-sensitive", action="store_true", help="Case-sensitive search")
     parser.add_argument("--files", help="Filter PDF filenames (substring match)")
+    parser.add_argument("--file", "-f", help="Direct PDF file path (overrides directory-based discovery)")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("-I", "--interactive", action="store_true", help="Interactive mode with fzf: filter, preview, and open PDFs")
     parser.add_argument("--extract-page", type=int, help="Extract full text of a page (by page number)")
@@ -616,11 +647,18 @@ def main():
         sys.exit(1)
 
     directory = Path(args.dir).expanduser().resolve()
-    if not directory.is_dir():
-        print(f"Error: '{directory}' is not a directory", file=sys.stderr)
-        sys.exit(1)
 
-    pdfs = find_pdfs(directory, args.files)
+    if args.file:
+        file_path = Path(args.file).expanduser().resolve()
+        if not file_path.is_file():
+            print(f"Error: '{args.file}' is not a file or does not exist", file=sys.stderr)
+            sys.exit(1)
+        pdfs = [file_path]
+    else:
+        if not directory.is_dir():
+            print(f"Error: '{directory}' is not a directory", file=sys.stderr)
+            sys.exit(1)
+        pdfs = find_pdfs(directory, args.files)
 
     def _exit_no_pdfs():
         msg = f"No PDFs found in {directory}"
@@ -638,7 +676,10 @@ def main():
     if args.list:
         if not pdfs:
             _exit_no_pdfs()
-        list_pdfs(pdfs)
+        if args.json:
+            list_pdfs_json(pdfs)
+        else:
+            list_pdfs(pdfs)
         return
 
     if args.extract_page:
@@ -685,7 +726,15 @@ def main():
         return
 
     if args.json:
-        print(json.dumps(all_results, ensure_ascii=False, indent=2))
+        match_count = len([r for r in all_results if "error" not in r])
+        output = {
+            "query": args.query,
+            "elapsed_ms": round(elapsed * 1000, 2),
+            "indexed": used_index,
+            "total_matches": match_count,
+            "matches": all_results,
+        }
+        print(json.dumps(output, ensure_ascii=False, indent=2))
     else:
         show_context = args.context > 0
         for r in all_results:
