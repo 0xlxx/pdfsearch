@@ -4,6 +4,7 @@ import sys
 import time
 from pathlib import Path
 
+from core.epub_searcher import find_epubs, search_epub
 from core.formatter import format_result
 from core.index_manager import _collect_index_map, build_index
 from core.interactive import _check_page_viewer, handle_open, run_fzf_interactive
@@ -17,7 +18,7 @@ def main():
         handle_open()
 
     parser = argparse.ArgumentParser(
-        description="High-performance PDF full-text search (PyMuPDF backend)",
+        description="High-performance full-text search for PDF, EPUB, and TXT files",
         epilog="Examples:\n"
                "  pdfsearch --index                        # build index for instant search\n"
                "  pdfsearch '鸦片战争'                       # search (uses index if available)\n"
@@ -60,15 +61,22 @@ def main():
         if file_path.suffix.lower() == ".txt":
             pdfs = []
             txts = [file_path]
+            epubs = []
+        elif file_path.suffix.lower() == ".epub":
+            pdfs = []
+            txts = []
+            epubs = [file_path]
         else:
             pdfs = [file_path]
             txts = []
+            epubs = []
     else:
         if not directory.is_dir():
             print(f"Error: '{directory}' is not a directory", file=sys.stderr)
             sys.exit(1)
         pdfs = find_pdfs(directory, args.files)
         txts = find_texts(directory, args.files)
+        epubs = find_epubs(directory, args.files)
 
     def _exit_no_pdfs():
         msg = f"No PDFs found in {directory}"
@@ -129,6 +137,10 @@ def main():
         for txt in txts:
             all_results.extend(search_txt(txt, args.query, args.regex, ignore_case, args.context))
 
+        for i, epub in enumerate(epubs):
+            label = f"{epub.name}  [{i + 1}/{len(epubs)}]"
+            all_results.extend(search_epub(epub, args.query, args.regex, args.context, ignore_case, label))
+
         elapsed = time.perf_counter() - start_time
         used_index = bool(index_map)
 
@@ -171,6 +183,8 @@ def main():
                     parts.append(f"{len(pdfs)} PDF(s)")
                 if txts:
                     parts.append(f"{len(txts)} txt file(s)")
+                if epubs:
+                    parts.append(f"{len(epubs)} EPUB(s)")
                 print(f"  Searched {' + '.join(parts)} in {elapsed:.2f}s")
             if not used_index and pdfs:
                 print(f"  Tip: run 'pdfsearch --index' for near-instant searches")

@@ -1,0 +1,14 @@
+[project]
+name = "pdfsearch"
+version = "0.6.0"
+requires-python = ">=3.13"
+dependencies = ["PyMuPDF>=1.27"]
+
+[project.scripts]
+pdfsearch = "core.cli:main"
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = ["pytest>=8"]
