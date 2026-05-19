@@ -131,3 +131,87 @@ def search_via_ripgrep(
         results.append(result)
 
     return results
+
+
+def search_txt(
+    path: Path,
+    query: str,
+    is_regex: bool,
+    ignore_case: bool,
+    context_lines: int,
+) -> list[dict]:
+    """Search a plain text file directly with ripgrep — no indexing, no PyMuPDF."""
+    rg_args = ["rg", "--json", "--with-filename", "--line-number", "--no-heading"]
+
+    if not is_regex:
+        rg_args.append("--fixed-strings")
+    if ignore_case:
+        rg_args.append("--ignore-case")
+
+    rg_args.extend(["--", query, str(path)])
+
+    try:
+        proc = subprocess.run(rg_args, capture_output=True, text=True)
+    except FileNotFoundError:
+        print("ripgrep (rg) not found. Install with: brew install ripgrep", file=sys.stderr)
+        return []
+
+    if proc.returncode not in (0, 1):
+        return []
+
+    file_lines = None
+    results = []
+
+    for line_text in proc.stdout.splitlines():
+        try:
+            entry = json.loads(line_text)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") != "match":
+            continue
+
+        data = entry.get("data", {})
+        line_num = data.get("line_number", 1)
+        line_idx = line_num - 1
+
+        lines_data = data.get("lines", {})
+        matched_line = lines_data.get("text", "").rstrip("\n").rstrip("\r")
+
+        submatches = data.get("submatches", [])
+        if submatches:
+            matched_text = submatches[0].get("match", {}).get("text", "")
+            line_bytes = matched_line.encode("utf-8")
+            m_start = len(line_bytes[:submatches[0].get("start", 0)].decode("utf-8"))
+            m_end = len(line_bytes[:submatches[0].get("end", 0)].decode("utf-8"))
+        else:
+            m_start = 0
+            m_end = 0
+            matched_text = ""
+
+        result = {
+            "file": str(path),
+            "filename": path.name,
+            "page": 1,
+            "total_pages": 1,
+            "line_num": line_idx + 1,
+            "line": matched_line.strip(),
+            "match": matched_text,
+            "match_start": m_start,
+            "match_end": m_end,
+            "context_before": [],
+            "context_after": [],
+        }
+
+        if context_lines > 0:
+            if file_lines is None:
+                try:
+                    file_lines = path.read_text().splitlines()
+                except OSError:
+                    file_lines = []
+            result["context_before"], result["context_after"] = _compute_context(
+                file_lines, line_idx, context_lines
+            )
+
+        results.append(result)
+
+    return results

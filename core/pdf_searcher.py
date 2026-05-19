@@ -1,6 +1,7 @@
 import json
-import re
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -13,6 +14,13 @@ def find_pdfs(directory: Path, name_filter: str | None = None) -> list[Path]:
     return pdfs
 
 
+def find_texts(directory: Path, name_filter: str | None = None) -> list[Path]:
+    texts = sorted(directory.rglob("*.txt"))
+    if name_filter:
+        texts = [t for t in texts if name_filter.lower() in t.name.lower()]
+    return texts
+
+
 def search_pdf(
     path: Path,
     pattern: str,
@@ -21,65 +29,56 @@ def search_pdf(
     ignore_case: bool,
     label: str = "",
 ) -> list[dict]:
-    results = []
-    compiled = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
-    total_pages = 0
-
+    """Search a PDF by extracting text to temp pages and delegating to ripgrep."""
     try:
         doc = fitz.open(str(path))
         total_pages = len(doc)
+    except Exception as e:
+        return [{"file": str(path), "error": str(e)}]
 
+    if total_pages == 0:
+        doc.close()
+        return []
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="pdfsearch_"))
+
+    try:
         for page_num in range(total_pages):
             if label:
-                print(f"\r  {label}  page {page_num + 1}/{total_pages}", end="", file=sys.stderr)
-            page = doc[page_num]
-            text = page.get_text("text")
-            if not text:
-                continue
+                print(f"\r  {label}  extracting page {page_num + 1}/{total_pages}", end="", file=sys.stderr)
+            text = doc[page_num].get_text("text")
+            (temp_dir / f"page_{page_num + 1:04d}.txt").write_text(text)
 
-            lines = text.splitlines()
-
-            for line_idx, line in enumerate(lines):
-                match_iter = compiled.finditer(line) if is_regex else None
-
-                if is_regex:
-                    for m in match_iter:
-                        results.append(
-                            _build_result(
-                                path, page_num, line_idx, line, m.start(),
-                                m.end(), lines, context_lines, total_pages
-                            )
-                        )
-                else:
-                    search_line = line.lower() if ignore_case else line
-                    search_pat = pattern.lower() if ignore_case else pattern
-                    start = 0
-                    while True:
-                        idx = search_line.find(search_pat, start)
-                        if idx == -1:
-                            break
-                        results.append(
-                            _build_result(
-                                path, page_num, line_idx, line, idx,
-                                idx + len(pattern), lines, context_lines, total_pages
-                            )
-                        )
-                        start = idx + 1
+        doc.close()
 
         if label:
-            print("\r\033[K", end="", file=sys.stderr)
-        doc.close()
+            print(f"\r\033[K", end="", file=sys.stderr)
+
+        index_map = {
+            str(temp_dir): {
+                "path": str(path),
+                "filename": path.name,
+                "pages": total_pages,
+            }
+        }
+
+        # Lazy import to break circular dependency (rg_searcher imports _compute_context from here)
+        from core.rg_searcher import search_via_ripgrep
+
+        return search_via_ripgrep(pattern, index_map, is_regex, ignore_case, context_lines)
+
     except KeyboardInterrupt:
-        print("\r\033[K", end="", file=sys.stderr)
-        doc.close()
+        if label:
+            print(f"\r\033[K", end="", file=sys.stderr)
+        try:
+            doc.close()
+        except Exception:
+            pass
         raise
     except Exception as e:
-        results.append({
-            "file": str(path),
-            "error": str(e),
-        })
-
-    return results
+        return [{"file": str(path), "error": str(e)}]
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _compute_context(
@@ -94,25 +93,6 @@ def _compute_context(
         [l.strip() for l in lines[ctx_start:line_idx]],
         [l.strip() for l in lines[line_idx + 1:ctx_end]],
     )
-
-
-def _build_result(
-    path, page_num, line_idx, line, match_start, match_end, lines, context_lines, total_pages
-):
-    ctx_before, ctx_after = _compute_context(lines, line_idx, context_lines)
-    return {
-        "file": str(path),
-        "filename": path.name,
-        "page": page_num + 1,
-        "total_pages": total_pages,
-        "line_num": line_idx + 1,
-        "line": line.strip(),
-        "match": line[match_start:match_end],
-        "match_start": match_start,
-        "match_end": match_end,
-        "context_before": ctx_before,
-        "context_after": ctx_after,
-    }
 
 
 def extract_page(path: Path, page_num: int) -> str | None:

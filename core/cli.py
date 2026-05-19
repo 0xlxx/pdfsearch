@@ -7,8 +7,8 @@ from pathlib import Path
 from core.formatter import format_result
 from core.index_manager import _collect_index_map, build_index
 from core.interactive import _check_page_viewer, handle_open, run_fzf_interactive
-from core.pdf_searcher import extract_page, find_pdfs, list_pdfs, list_pdfs_json, search_pdf
-from core.rg_searcher import search_via_ripgrep
+from core.pdf_searcher import extract_page, find_pdfs, find_texts, list_pdfs, list_pdfs_json, search_pdf
+from core.rg_searcher import search_txt, search_via_ripgrep
 
 
 def main():
@@ -57,12 +57,18 @@ def main():
         if not file_path.is_file():
             print(f"Error: '{args.file}' is not a file or does not exist", file=sys.stderr)
             sys.exit(1)
-        pdfs = [file_path]
+        if file_path.suffix.lower() == ".txt":
+            pdfs = []
+            txts = [file_path]
+        else:
+            pdfs = [file_path]
+            txts = []
     else:
         if not directory.is_dir():
             print(f"Error: '{directory}' is not a directory", file=sys.stderr)
             sys.exit(1)
         pdfs = find_pdfs(directory, args.files)
+        txts = find_texts(directory, args.files)
 
     def _exit_no_pdfs():
         msg = f"No PDFs found in {directory}"
@@ -120,6 +126,9 @@ def main():
             label = f"{pdf.name}  [{i + 1}/{len(unindexed)}]"
             all_results.extend(search_pdf(pdf, args.query, args.regex, args.context, ignore_case, label))
 
+        for txt in txts:
+            all_results.extend(search_txt(txt, args.query, args.regex, ignore_case, args.context))
+
         elapsed = time.perf_counter() - start_time
         used_index = bool(index_map)
 
@@ -157,7 +166,12 @@ def main():
             if used_index:
                 print(f"  Searched index ({len(pdfs)} PDFs) in {elapsed:.2f}s")
             else:
-                print(f"  Searched {len(pdfs)} PDF(s) in {elapsed:.2f}s")
+                parts = []
+                if pdfs:
+                    parts.append(f"{len(pdfs)} PDF(s)")
+                if txts:
+                    parts.append(f"{len(txts)} txt file(s)")
+                print(f"  Searched {' + '.join(parts)} in {elapsed:.2f}s")
             if not used_index and pdfs:
                 print(f"  Tip: run 'pdfsearch --index' for near-instant searches")
             if not _check_page_viewer() and has_matches:
