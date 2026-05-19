@@ -23,18 +23,36 @@ def _check_page_viewer() -> bool:
     return _has_skim() or shutil.which("sioyek") is not None
 
 
-def open_pdf_at_page(filepath: str, page: int) -> bool:
-    """Open a PDF at a specific page, trying viewers in priority order.
+def open_result(filepath: str, page: int, line_num: int = 0) -> bool:
+    """Open a search result at the right location, dispatching by file type.
 
-    Chain: Skim (AppleScript) → Sioyek (--page) → open (no page nav).
-    Returns True if page-accurate navigation succeeded, False otherwise.
+    PDF  → Skim (AppleScript) → Sioyek (--page) → open (no page nav)
+    EPUB → open (Books.app / default EPUB reader)
+    TXT  → code -g (VS Code) → subl (Sublime) → open (no line nav)
+
+    Returns True if accurate navigation succeeded, False otherwise.
     """
     path = Path(filepath)
     if not path.exists():
         print(f"Error: file not found: {filepath}", file=sys.stderr)
         return False
 
-    # 1. Skim via AppleScript — most reliable page navigation
+    suffix = path.suffix.lower()
+
+    if suffix == ".pdf":
+        return _open_pdf(path, page)
+    elif suffix == ".epub":
+        subprocess.run(["open", str(path)], check=False)
+        return False
+    elif suffix == ".txt":
+        return _open_txt(path, line_num)
+    else:
+        subprocess.run(["open", str(path)], check=False)
+        return False
+
+
+def _open_pdf(path: Path, page: int) -> bool:
+    """Open a PDF at a specific page."""
     if _has_skim():
         script = f'''
         tell application "Skim"
@@ -52,7 +70,6 @@ def open_pdf_at_page(filepath: str, page: int) -> bool:
         except Exception:
             pass
 
-    # 2. Sioyek via --page flag (brew install sioyek)
     if shutil.which("sioyek"):
         try:
             subprocess.run(
@@ -63,19 +80,33 @@ def open_pdf_at_page(filepath: str, page: int) -> bool:
         except Exception:
             pass
 
-    # 3. Fallback: open in default viewer (no page navigation)
+    subprocess.run(["open", str(path)], check=False)
+    return False
+
+
+def _open_txt(path: Path, line_num: int) -> bool:
+    """Open a text file, trying to jump to line_num."""
+    if line_num > 0 and shutil.which("code"):
+        subprocess.run(["code", "-g", f"{path}:{line_num}"], check=False)
+        return True
+    if line_num > 0 and shutil.which("subl"):
+        subprocess.run(["subl", f"{path}:{line_num}"], check=False)
+        return True
     subprocess.run(["open", str(path)], check=False)
     return False
 
 
 def handle_open() -> None:
-    """Open PDF at page. Called via --_open <path> <page> (from fzf key bindings)."""
+    """Open result at location. Called via --_open <path> <page> [line_num] (from fzf key bindings)."""
     import argparse as ap
     p = ap.ArgumentParser(add_help=False)
-    p.add_argument("--_open", nargs=2)
+    p.add_argument("--_open", nargs="*")
     args, _ = p.parse_known_args()
-    if args._open:
-        open_pdf_at_page(args._open[0], int(args._open[1]))
+    if args._open and len(args._open) >= 2:
+        filepath = args._open[0]
+        page = int(args._open[1])
+        line_num = int(args._open[2]) if len(args._open) >= 3 else 0
+        open_result(filepath, page, line_num)
         sys.exit(0)
 
 
@@ -90,11 +121,18 @@ def run_fzf_interactive(results: list[dict]) -> None:
         print("No matches to open.", file=sys.stderr)
         return
 
-    # Build fzf input: display \t filepath \t page
+    # Build fzf input: display \t filepath \t page \t line_num
     lines = []
     for r in valid:
-        display = f"{r['filename']}  p{r['page']}  ▶  {r['line'][:120]}"
-        lines.append(f"{display}\t{r['file']}\t{r['page']}\n")
+        name = r["filename"]
+        if name.lower().endswith(".txt"):
+            loc = f"L{r['line_num']}"
+        elif name.lower().endswith(".epub"):
+            loc = f"ch{r['page']}/{r['total_pages']}"
+        else:
+            loc = f"p{r['page']}/{r['total_pages']}"
+        display = f"{name}  {loc}  ▶  {r['line'][:120]}"
+        lines.append(f"{display}\t{r['file']}\t{r['page']}\t{r['line_num']}\n")
     fzf_input = "".join(lines)
 
     # Resolve self-path for --_open sub-calls.
@@ -109,7 +147,7 @@ def run_fzf_interactive(results: list[dict]) -> None:
 
     open_cmd = (
         f"PYTHONPATH={shlex.quote(lib_dir)} "
-        f"{shlex.quote(str(self_path))} --_open '{{1}}' '{{2}}'"
+        f"{shlex.quote(str(self_path))} --_open '{{1}}' '{{2}}' '{{3}}'"
     )
 
     fzf_args = [
@@ -148,5 +186,13 @@ def run_fzf_interactive(results: list[dict]) -> None:
         if len(parts) >= 3:
             filepath = parts[1]
             page = int(parts[2])
-            print(f"\n  → Opening {Path(filepath).name} at page {page}...")
-            open_pdf_at_page(filepath, page)
+            line_num = int(parts[3]) if len(parts) >= 4 else 0
+
+            name = Path(filepath).name
+            if name.lower().endswith(".txt"):
+                print(f"\n  → Opening {name} at line {line_num}...")
+            elif name.lower().endswith(".epub"):
+                print(f"\n  → Opening {name} at chapter {page}...")
+            else:
+                print(f"\n  → Opening {name} at page {page}...")
+            open_result(filepath, page, line_num)
