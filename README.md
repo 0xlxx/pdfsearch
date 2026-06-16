@@ -1,3 +1,8 @@
+> [!WARNING]
+> **DEPRECATED**: This repository is now archived and deprecated.
+> It has been completely rewritten in Rust for better performance and LLM-agent workflow compatibility.
+> Please use the new replacement tool: **[paperfetcher](https://github.com/0xlxx/paperfetcher)**
+
 # pdfsearch
 
 High-performance PDF full-text search with text indexing and fzf interactive mode.
